@@ -1,17 +1,41 @@
 import os
+import sys
+
+from dotenv import load_dotenv
+from openai import OpenAI
 from telegram import Update, ReplyKeyboardMarkup
 from telegram.ext import ApplicationBuilder, CommandHandler, MessageHandler, ContextTypes, filters
-import openai
-from dotenv import load_dotenv
 
-load_dotenv()
+# === ЗАГРУЗКА .ENV ===
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+ENV_PATH = os.path.join(BASE_DIR, ".env")
+load_dotenv(dotenv_path=ENV_PATH)
+
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
-openai.api_key = OPENAI_API_KEY
 
+def check_env_var(name, value, min_len=10):
+    if not value:
+        print(f"[ENV ERROR] {name} не найден. Проверь .env", file=sys.stderr)
+        return False
+    if len(value.strip()) < min_len:
+        print(f"[ENV WARNING] {name} слишком короткий: {repr(value)}", file=sys.stderr)
+    if value != value.strip():
+        print(f"[ENV WARNING] {name} содержит лишние пробелы: {repr(value)}", file=sys.stderr)
+    return True
+
+if not (check_env_var("BOT_TOKEN", BOT_TOKEN, 20) and check_env_var("OPENAI_API_KEY", OPENAI_API_KEY, 20)):
+    sys.exit("Остановлено: нет корректных переменных окружения.")
+
+# === КОНФИГ OpenAI ===
+MODEL_NAME = "gpt-4o-mini"
+client = OpenAI(api_key=OPENAI_API_KEY)
+
+# === СОСТОЯНИЕ ПОЛЬЗОВАТЕЛЕЙ ===
 user_state = {}
 user_data = {}
 
+# === ОБРАБОТЧИКИ ===
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_state[update.effective_chat.id] = "AWAIT_NEXT"
     markup = ReplyKeyboardMarkup([["Далее"]], resize_keyboard=True, one_time_keyboard=True)
@@ -24,16 +48,23 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def ask_chatgpt(prompt: str) -> str:
     try:
-        response = openai.ChatCompletion.create(
-            model="gpt-4",
+        response = client.chat.completions.create(
+            model=MODEL_NAME,
             messages=[
-                {"role": "system", "content": "Ты заботливый помощник по уходу за домашними животными. Отвечай просто и понятно."},
+                {"role": "system",
+                 "content": (
+                     "Ты — заботливый и дружелюбный помощник по уходу за домашними животными. "
+                     "Твоя задача — помогать владельцам собак и кошек с воспитанием, дрессировкой, уходом, "
+                     "питанием, играми и здоровьем питомцев. "
+                     "Если вопрос не связан с животными, вежливо отвечай: 'Я могу помочь только с вопросами о питомцах.'"
+                 )},
                 {"role": "user", "content": prompt}
             ],
-            temperature=0.7
+            temperature=0.7,
         )
-        return response['choices'][0]['message']['content']
+        return response.choices[0].message.content
     except Exception as e:
+        print(f"[OpenAI ERROR] {e}", file=sys.stderr)
         return "Произошла ошибка при обращении к ИИ. Попробуй позже."
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -59,7 +90,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         markup = ReplyKeyboardMarkup([
             ["Уход и питание", "Поведение и здоровье"],
             ["Игры и досуг", "Путешествия с питомцем"],
-            ["Экстренные советы", "Напиши свой вариант"]
+            ["Дрессировка", "Напиши свой вариант"]
         ], resize_keyboard=True)
         await update.message.reply_text("В чём тебе важнее всего моя помощь?", reply_markup=markup)
 
@@ -77,7 +108,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         markup = ReplyKeyboardMarkup([["Воспитание", "Дрессировка", "Игры", "Уход"]], resize_keyboard=True)
         await update.message.reply_text(
             "Отлично, всё готово. Можешь задать любой вопрос:\n\n"
-            "Примеры:\n- Как приучить щенка к туалету?\n- Чем кормить щенка хаски?",
+            "Примеры:\n- Как приучить щенка к туалету?\n- Как научить собаку команде 'Сидеть'?",
             reply_markup=markup
         )
 
