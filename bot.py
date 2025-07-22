@@ -1,7 +1,7 @@
 import os
 import sys
-import warnings
 import asyncio
+import warnings
 from typing import Dict, List, Optional
 
 from dotenv import load_dotenv
@@ -14,12 +14,11 @@ from telegram.ext import (
     ContextTypes,
     filters,
 )
+from telegram.error import TimedOut
 
-# --- ПРЕДУПРЕЖДЕНИЯ -----------------------------------------------------------
-# Игнорируем DeprecationWarnings от Assistants API (мы его слегка трогаем только для чтения инструкций)
-warnings.filterwarnings("ignore", category=DeprecationWarning)
-
-# --- ЗАГРУЗКА ОКРУЖЕНИЯ -------------------------------------------------------
+# ---------------------------------------------------------------------------
+#  Environment
+# ---------------------------------------------------------------------------
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 ENV_PATH = os.path.join(BASE_DIR, ".env")
 if os.path.exists(ENV_PATH):
@@ -29,8 +28,8 @@ else:
 
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
-ASSISTANT_ID = os.getenv("ASSISTANT_ID")  # опционально
-MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini")  # можно переопределить в Railway
+ASSISTANT_ID = os.getenv("ASSISTANT_ID")  # optional
+MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
 
 def check_env_var(name: str, value: Optional[str], min_len=10) -> bool:
     if not value:
@@ -40,13 +39,20 @@ def check_env_var(name: str, value: Optional[str], min_len=10) -> bool:
         print(f"[ENV WARNING] {name} слишком короткий: {repr(value)}", file=sys.stderr)
     return True
 
-if not (check_env_var("BOT_TOKEN", BOT_TOKEN, 20) and check_env_var("OPENAI_API_KEY", OPENAI_API_KEY, 20)):
+if not (
+    check_env_var("BOT_TOKEN", BOT_TOKEN, 20)
+    and check_env_var("OPENAI_API_KEY", OPENAI_API_KEY, 20)
+):
     sys.exit("Остановлено: нет корректных переменных окружения.")
 
-# --- OpenAI клиент ------------------------------------------------------------
+# ---------------------------------------------------------------------------
+#  OpenAI client
+# ---------------------------------------------------------------------------
+# Фильтруем DeprecationWarnings (Assistants API deprecated)
+warnings.filterwarnings("ignore", category=DeprecationWarning)
+
 client = OpenAI(api_key=OPENAI_API_KEY)
 
-# --- Получаем инструкции ассистента (если есть) -------------------------------
 DEFAULT_INSTRUCTIONS = (
     "Ты — заботливый и дружелюбный помощник по уходу за домашними животными. "
     "Помогай владельцам собак и кошек с воспитанием, дрессировкой, уходом, питанием, "
@@ -56,8 +62,7 @@ DEFAULT_INSTRUCTIONS = (
 )
 
 def load_assistant_instructions() -> str:
-    """Если задан ASSISTANT_ID, пробуем подтянуть инструкции ассистента.
-    Иначе — возвращаем дефолтные инструкции."""
+    """Попытка получить instructions из заданного ассистента."""
     if not ASSISTANT_ID:
         print("[ASSISTANT] ASSISTANT_ID не задан. Используем дефолтные инструкции.")
         return DEFAULT_INSTRUCTIONS
@@ -65,20 +70,70 @@ def load_assistant_instructions() -> str:
         a = client.beta.assistants.retrieve(ASSISTANT_ID)
         inst = (a.instructions or "").strip()
         if not inst:
-            print("[ASSISTANT] У ассистента нет инструкций. Используем дефолтные.")
+            print("[ASSISTANT] Инструкции ассистента пустые. Используем дефолтные.")
             return DEFAULT_INSTRUCTIONS
-        print("[ASSISTANT] Инструкции ассистента успешно загружены.")
+        print("[ASSISTANT] Инструкции ассистента загружены.")
         return inst
     except Exception as e:
-        print(f"[ASSISTANT ERROR] Не удалось получить инструкции: {e}", file=sys.stderr)
+        print(f"[ASSISTANT ERROR] {e}", file=sys.stderr)
         return DEFAULT_INSTRUCTIONS
 
 SYSTEM_PROMPT = load_assistant_instructions()
 
-# --- Контекст чатов -----------------------------------------------------------
-# chat_id -> list[{"role": "...", "content": "..."}]
+# ---------------------------------------------------------------------------
+#  Assistants Thread logging (optional but requested)
+# ---------------------------------------------------------------------------
+# Сохраняем thread_id для каждого Telegram chat_id в памяти.
+user_threads: Dict[int, str] = {}
+LOG_ONBOARDING_TO_THREAD = False       # можно True, если хочешь логировать все шаги
+ASSOCIATE_THREAD_WITH_ASSISTANT = True # создаём 1 run при /start, чтобы Thread появился в UI
+
+def _create_thread_for_chat_sync(chat_id: int, username: Optional[str]) -> str:
+    meta = {"telegram_chat_id": str(chat_id)}
+    if username:
+        meta["telegram_username"] = username
+    thread = client.beta.threads.create(metadata=meta)
+    print(f"[THREAD CREATED] chat_id={chat_id} -> {thread.id}")
+    # Чтобы Thread был связан с ассистентом в UI: создадим run (не ждём ответа)
+    if ASSISTANT_ID and ASSOCIATE_THREAD_WITH_ASSISTANT:
+        try:
+            client.beta.threads.runs.create(
+                thread_id=thread.id,
+                assistant_id=ASSISTANT_ID,
+                # Не обязательно что-то передавать; этот run просто «регистрирует» связь
+                instructions="Bootstrap run: связать Thread с ассистентом."
+            )
+        except Exception as e:
+            print(f"[THREAD RUN WARN] Не удалось связать Thread с ассистентом: {e}", file=sys.stderr)
+    return thread.id
+
+async def get_or_create_thread_for_chat(chat_id: int, username: Optional[str]) -> str:
+    if chat_id in user_threads:
+        return user_threads[chat_id]
+    thread_id = await asyncio.to_thread(_create_thread_for_chat_sync, chat_id, username)
+    user_threads[chat_id] = thread_id
+    return thread_id
+
+def _log_message_to_thread_sync(thread_id: str, role: str, content: str):
+    try:
+        client.beta.threads.messages.create(
+            thread_id=thread_id,
+            role=role,
+            content=content,
+        )
+    except Exception as e:
+        print(f"[THREAD MSG ERROR] {e}", file=sys.stderr)
+
+async def log_message_to_thread(thread_id: str, role: str, content: str):
+    # Асинхронно: не блокируем Telegram-бот
+    await asyncio.to_thread(_log_message_to_thread_sync, thread_id, role, content)
+
+# ---------------------------------------------------------------------------
+#  Local chat history for Responses API (context memory)
+# ---------------------------------------------------------------------------
+# chat_id -> list of {role, content}
 chat_history: Dict[int, List[dict]] = {}
-MAX_HISTORY = 30  # сколько сообщений (кроме system) держим
+MAX_HISTORY = 30  # без system
 
 def ensure_history(chat_id: int):
     if chat_id not in chat_history:
@@ -87,7 +142,6 @@ def ensure_history(chat_id: int):
 def add_to_history(chat_id: int, role: str, content: str):
     ensure_history(chat_id)
     chat_history[chat_id].append({"role": role, "content": content})
-    # ограничиваем историю (system + хвост)
     system = chat_history[chat_id][:1]
     tail = chat_history[chat_id][1:][-MAX_HISTORY:]
     chat_history[chat_id] = system + tail
@@ -96,76 +150,122 @@ def build_messages(chat_id: int) -> List[dict]:
     ensure_history(chat_id)
     return chat_history[chat_id]
 
-# --- GPT вызов (в фоне, чтобы не блокировать event loop) ----------------------
 def _get_gpt_reply_sync(chat_id: int) -> str:
     try:
+        messages = build_messages(chat_id)
         resp = client.responses.create(
             model=MODEL,
-            messages=build_messages(chat_id),
+            messages=messages,
             max_output_tokens=600,
         )
         text = resp.output_text or "Ассистент не прислал ответ."
-        # сохраняем в историю
+        # сохраняем в локальную историю
         add_to_history(chat_id, "assistant", text)
         return text
     except Exception as e:
-        print(f"[OpenAI ERROR] {e}", file=sys.stderr)
-        return "Ошибка при обращении к GPT."
+        import traceback
+        print(f"[GPT ERROR] {e}\n{traceback.format_exc()}", file=sys.stderr)
+        return f"Ошибка при обращении к GPT: {e}"
 
 async def get_gpt_reply(chat_id: int) -> str:
-    # выполняем синхронный вызов OpenAI в отдельном потоке,
-    # чтобы не блокировать asyncio-цикл Telegram.
     return await asyncio.to_thread(_get_gpt_reply_sync, chat_id)
 
-# --- Состояние онбординга -----------------------------------------------------
+# ---------------------------------------------------------------------------
+#  Onboarding state
+# ---------------------------------------------------------------------------
 user_state: Dict[int, str] = {}
 user_data: Dict[int, dict] = {}
 
-# --- Хэндлеры -----------------------------------------------------------------
+# ---------------------------------------------------------------------------
+#  Telegram helpers
+# ---------------------------------------------------------------------------
+async def safe_reply(update: Update, text: str, **kwargs):
+    try:
+        return await update.message.reply_text(text, **kwargs)
+    except TimedOut:
+        print("[TG WARNING] reply timeout", file=sys.stderr)
+    except Exception as e:
+        print(f"[TG ERROR] reply_text: {e}", file=sys.stderr)
+    return None
+
+async def safe_edit(message, text: str):
+    if not message:
+        return
+    try:
+        await message.edit_text(text)
+    except TimedOut:
+        print("[TG WARNING] edit timeout", file=sys.stderr)
+    except Exception as e:
+        print(f"[TG ERROR] edit_text: {e}", file=sys.stderr)
+
+# ---------------------------------------------------------------------------
+#  Handlers
+# ---------------------------------------------------------------------------
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
+    username = update.effective_chat.username
+
     ensure_history(chat_id)
     user_state[chat_id] = "AWAIT_NEXT"
+
+    # создаём Assistants Thread (логирование)
+    thread_id = await get_or_create_thread_for_chat(chat_id, username)
+
     markup = ReplyKeyboardMarkup([["Далее"]], resize_keyboard=True, one_time_keyboard=True)
     text = (
         "Привет! Я твой помощник по уходу за домашним питомцем.\n"
         "Помогу с уходом, дрессировками, играми и по любым вопросам.\n"
         "Начнём с небольшой настройки — так я смогу быть максимально полезным."
     )
-    await update.message.reply_text(text, reply_markup=markup)
+    await safe_reply(update, text, reply_markup=markup)
     add_to_history(chat_id, "assistant", text)
 
+    if LOG_ONBOARDING_TO_THREAD:
+        asyncio.create_task(log_message_to_thread(thread_id, "assistant", text))
+
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    text = update.message.text
     chat_id = update.effective_chat.id
+    username = update.effective_chat.username
+    text = update.message.text
     state = user_state.get(chat_id)
+
+    # thread для логов
+    thread_id = await get_or_create_thread_for_chat(chat_id, username)
 
     if state == "AWAIT_NEXT" and text == "Далее":
         user_state[chat_id] = "AWAIT_PET_TYPE"
         markup = ReplyKeyboardMarkup([["Кошка", "Собака", "Оба"]], resize_keyboard=True, one_time_keyboard=True)
         bot_text = "Кто у тебя дома?"
-        await update.message.reply_text(bot_text, reply_markup=markup)
+        await safe_reply(update, bot_text, reply_markup=markup)
         add_to_history(chat_id, "assistant", bot_text)
+        if LOG_ONBOARDING_TO_THREAD:
+            asyncio.create_task(log_message_to_thread(thread_id, "assistant", bot_text))
         return
 
     if state == "AWAIT_PET_TYPE":
         user_data[chat_id] = {"pet_type": text}
         user_state[chat_id] = "AWAIT_PET_INFO"
         bot_text = "Расскажи о питомце:\n1. Имя:\n2. Порода:\n3. Возраст:\n4. Вес:\n5. Пол:"
-        await update.message.reply_text(bot_text)
+        await safe_reply(update, bot_text)
         add_to_history(chat_id, "user", f"Тип питомца: {text}")
         add_to_history(chat_id, "assistant", bot_text)
+        if LOG_ONBOARDING_TO_THREAD:
+            asyncio.create_task(log_message_to_thread(thread_id, "user", f"Тип питомца: {text}"))
+            asyncio.create_task(log_message_to_thread(thread_id, "assistant", bot_text))
         return
 
     if state == "AWAIT_PET_INFO":
         user_data[chat_id]["pet_info"] = text
         user_state[chat_id] = "DONE"
-        # Добавим профиль в контекст (важно для последующих ответов GPT!)
+
+        # Контекст профиля добавим в историю как assistant (служебное)
         profile_text = (
             f"Контекст: у пользователя {user_data[chat_id].get('pet_type')} питомец. "
-            f"Данные: {text}. Используй это в дальнейших ответах."
+            f"Данные: {text}. Учитывай это в дальнейших ответах."
         )
         add_to_history(chat_id, "assistant", profile_text)
+        if LOG_ONBOARDING_TO_THREAD:
+            asyncio.create_task(log_message_to_thread(thread_id, "assistant", profile_text))
 
         markup = ReplyKeyboardMarkup(
             [["Воспитание", "Дрессировка"], ["Игры", "Уход"]],
@@ -176,23 +276,38 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "Примеры:\n- Как приучить щенка к туалету?\n- Как научить собаку команде 'Сидеть'?\n"
             "Или выбери интересующую тему ниже."
         )
-        await update.message.reply_text(bot_text, reply_markup=markup)
+        await safe_reply(update, bot_text, reply_markup=markup)
         add_to_history(chat_id, "assistant", bot_text)
+        if LOG_ONBOARDING_TO_THREAD:
+            asyncio.create_task(log_message_to_thread(thread_id, "user", f"Инфо о питомце: {text}"))
+            asyncio.create_task(log_message_to_thread(thread_id, "assistant", bot_text))
         return
 
     if state == "DONE":
-        # логируем сообщение пользователя и спрашиваем GPT
+        # Логируем user сообщение в локальный контекст
         add_to_history(chat_id, "user", text)
-        thinking = await update.message.reply_text("Секунду, думаю…")
+        # И в Thread (чтобы видеть в OpenAI UI)
+        asyncio.create_task(log_message_to_thread(thread_id, "user", text))
+
+        thinking = await safe_reply(update, "Секунду, думаю…")
+
         reply = await get_gpt_reply(chat_id)
-        await thinking.edit_text(reply)
+
+        # Логируем ответ ассистента в Thread
+        asyncio.create_task(log_message_to_thread(thread_id, "assistant", reply))
+
+        await safe_edit(thinking, reply)
         return
 
     # fallback
     bot_text = "Пожалуйста, нажми /start для начала."
-    await update.message.reply_text(bot_text)
+    await safe_reply(update, bot_text)
     add_to_history(chat_id, "assistant", bot_text)
+    asyncio.create_task(log_message_to_thread(thread_id, "assistant", bot_text))
 
+# ---------------------------------------------------------------------------
+#  Main
+# ---------------------------------------------------------------------------
 def main():
     app = (
         ApplicationBuilder()
