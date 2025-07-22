@@ -30,7 +30,7 @@ else:
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 ASSISTANT_ID = os.getenv("ASSISTANT_ID")  # опционально
-MODEL = os.getenv("OPENAI_MODEL", "gpt-4.1-mini")  # можно переопределить в Railway
+MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini")  # можно переопределить в Railway
 
 def check_env_var(name: str, value: Optional[str], min_len=10) -> bool:
     if not value:
