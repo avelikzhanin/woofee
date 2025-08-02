@@ -2,7 +2,7 @@ import os
 import time
 from dotenv import load_dotenv
 from openai import OpenAI
-from telegram import Update, ReplyKeyboardMarkup
+from telegram import Update, ReplyKeyboardMarkup, ReplyKeyboardRemove
 from telegram.ext import ApplicationBuilder, CommandHandler, MessageHandler, ContextTypes, filters
 
 load_dotenv()
@@ -99,7 +99,8 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         user_data[chat_id] = {"pet_type": text}
         user_state[chat_id] = "AWAIT_PET_INFO"
         await update.message.reply_text(
-            "Расскажи о питомце:\n1. Имя:\n2. Порода:\n3. Возраст:\n4. Вес:\n5. Пол:"
+            "Расскажи о питомце:\n1. Имя:\n2. Порода:\n3. Возраст:\n4. Вес:\n5. Пол:",
+            reply_markup=ReplyKeyboardRemove()
         )
 
     elif state == "AWAIT_PET_INFO":
@@ -108,9 +109,13 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         markup = ReplyKeyboardMarkup([
             ["Уход и питание", "Поведение и здоровье"],
             ["Игры и досуг", "Напиши свой вариант"],
-        ], resize_keyboard=True)
+        ], resize_keyboard=True, one_time_keyboard=True)
         await update.message.reply_text("В чём тебе важнее всего моя помощь?", reply_markup=markup)
 
+    elif state == "AWAIT_HELP_AREA":
+        user_data[chat_id]["help_area"] = text
+        user_state[chat_id] = "DONE"
+        
         # Отправляем контекст пользователя в Assistant
         user_context = f"""
         Информация о пользователе:
@@ -123,11 +128,10 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         
         await ask_assistant(user_context, chat_id)
         
-        markup = ReplyKeyboardMarkup([["Воспитание", "Дрессировка", "Игры", "Уход"]], resize_keyboard=True)
         await update.message.reply_text(
-            "Отлично, всё готово. Можешь задать любой вопрос:\n\n"
+            "Отлично, всё готово! Можешь задать любой вопрос:\n\n"
             "Примеры:\n- Как приучить щенка к туалету?\n- Чем кормить щенка хаски?",
-            reply_markup=markup
+            reply_markup=ReplyKeyboardRemove()
         )
 
     elif state == "DONE":
