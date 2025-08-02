@@ -107,23 +107,10 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         user_state[chat_id] = "AWAIT_HELP_AREA"
         markup = ReplyKeyboardMarkup([
             ["Уход и питание", "Поведение и здоровье"],
-            ["Игры и досуг", "Путешествия с питомцем"],
-            ["Экстренные советы", "Напиши свой вариант"]
+            ["Игры и досуг", "Напиши свой вариант"],
         ], resize_keyboard=True)
         await update.message.reply_text("В чём тебе важнее всего моя помощь?", reply_markup=markup)
 
-    elif state == "AWAIT_HELP_AREA":
-        user_data[chat_id]["help_area"] = text
-        user_state[chat_id] = "AWAIT_REMINDER_SETUP"
-        markup = ReplyKeyboardMarkup([["Настроить", "Пропустить"]], resize_keyboard=True)
-        await update.message.reply_text(
-            "Хочешь, чтобы я напоминал о:\n- Кормлении\n- Обработках\n- Прививках\n- Стрижке когтей\n- Тренировках",
-            reply_markup=markup
-        )
-
-    elif state == "AWAIT_REMINDER_SETUP":
-        user_state[chat_id] = "DONE"
-        
         # Отправляем контекст пользователя в Assistant
         user_context = f"""
         Информация о пользователе:
