@@ -1,75 +1,161 @@
-import logging
-import asyncio
-from aiogram import Bot, Dispatcher, types
-from aiogram.types import Message
-from aiogram.utils import executor
-from openai import AsyncOpenAI
 import os
+import time
+from dotenv import load_dotenv
+from openai import OpenAI
+from telegram import Update, ReplyKeyboardMarkup
+from telegram.ext import ApplicationBuilder, CommandHandler, MessageHandler, ContextTypes, filters
 
-API_TOKEN = os.getenv("TELEGRAM_API_TOKEN")
+load_dotenv()
+BOT_TOKEN = os.getenv("BOT_TOKEN")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
-ASSISTANT_ID = os.getenv("OPENAI_ASSISTANT_ID")
+ASSISTANT_ID = os.getenv("ASSISTANT_ID")  # ID вашего Assistant
 
-bot = Bot(token=API_TOKEN)
-dp = Dispatcher(bot)
-client = AsyncOpenAI(api_key=OPENAI_API_KEY)
+client = OpenAI(api_key=OPENAI_API_KEY)
 
+user_state = {}
 user_data = {}
+user_threads = {}  # Для хранения thread_id каждого пользователя
 
-@dp.message_handler(commands=["start"])
-async def start(message: Message):
-    await message.answer("Привет! Я твой ИИ-помощник. Задай мне вопрос!")
-
-async def ask_assistant_via_thread(chat_id: int, prompt: str) -> str:
-    if chat_id not in user_data:
-        user_data[chat_id] = {}
-
-    if "thread_id" not in user_data[chat_id]:
-        thread = await client.beta.threads.create()
-        user_data[chat_id]["thread_id"] = thread.id
-
-    thread_id = user_data[chat_id]["thread_id"]
-
-    await client.beta.threads.messages.create(
-        thread_id=thread_id,
-        role="user",
-        content=prompt
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    chat_id = update.effective_chat.id
+    user_state[chat_id] = "AWAIT_NEXT"
+    
+    # Создаем новый thread для пользователя
+    thread = client.beta.threads.create()
+    user_threads[chat_id] = thread.id
+    
+    markup = ReplyKeyboardMarkup([["Далее"]], resize_keyboard=True, one_time_keyboard=True)
+    await update.message.reply_text(
+        "Привет! Я твой помощник по уходу за домашним питомцем.\n"
+        "Помогу с уходом, дрессировками, играми и по любым вопросам.\n"
+        "Начнём с небольшой настройки — так я смогу быть максимально полезным.",
+        reply_markup=markup
     )
 
-    run = await client.beta.threads.runs.create(
-        thread_id=thread_id,
-        assistant_id=ASSISTANT_ID
-    )
-
-    while True:
-        run_status = await client.beta.threads.runs.retrieve(
-            thread_id=thread_id,
-            run_id=run.id
-        )
-        if run_status.status == "completed":
-            break
-        elif run_status.status == "failed":
-            return "❌ Ошибка выполнения запроса."
-        await asyncio.sleep(1)
-
-    messages = await client.beta.threads.messages.list(thread_id=thread_id)
-    for msg in reversed(messages.data):
-        if msg.role == "assistant":
-            return msg.content[0].text.value
-
-    return "❌ Ответ не получен."
-
-@dp.message_handler()
-async def handle_message(message: Message):
-    chat_id = message.chat.id
-    text = message.text
-    await message.chat.do("typing")
+async def ask_assistant(prompt: str, chat_id: int) -> str:
     try:
-        reply = await ask_assistant_via_thread(chat_id, text)
+        thread_id = user_threads.get(chat_id)
+        
+        if not thread_id:
+            # Создаем новый thread если его нет
+            thread = client.beta.threads.create()
+            user_threads[chat_id] = thread.id
+            thread_id = thread.id
+        
+        # Добавляем сообщение в thread
+        client.beta.threads.messages.create(
+            thread_id=thread_id,
+            role="user",
+            content=prompt
+        )
+        
+        # Запускаем Assistant
+        run = client.beta.threads.runs.create(
+            thread_id=thread_id,
+            assistant_id=ASSISTANT_ID
+        )
+        
+        # Ждем завершения выполнения
+        while run.status in ['queued', 'in_progress', 'cancelling']:
+            time.sleep(1)
+            run = client.beta.threads.runs.retrieve(
+                thread_id=thread_id,
+                run_id=run.id
+            )
+        
+        if run.status == 'completed':
+            # Получаем сообщения из thread
+            messages = client.beta.threads.messages.list(
+                thread_id=thread_id
+            )
+            
+            # Возвращаем последний ответ Assistant
+            for message in messages.data:
+                if message.role == "assistant":
+                    return message.content[0].text.value
+        
+        elif run.status == 'requires_action':
+            # Если требуется действие (например, function calling)
+            return "Assistant требует дополнительных действий. Попробуйте переформулировать вопрос."
+        
+        else:
+            return f"Ошибка выполнения: {run.status}"
+            
     except Exception as e:
-        reply = "Произошла ошибка: " + str(e)
-    await message.answer(reply)
+        print(f"Ошибка при обращении к Assistant API: {e}")
+        return "Произошла ошибка при обращении к ИИ. Попробуй позже."
+
+async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    text = update.message.text
+    chat_id = update.effective_chat.id
+    state = user_state.get(chat_id)
+
+    if state == "AWAIT_NEXT" and text == "Далее":
+        user_state[chat_id] = "AWAIT_PET_TYPE"
+        markup = ReplyKeyboardMarkup([["Кошка", "Собака", "Оба"]], resize_keyboard=True, one_time_keyboard=True)
+        await update.message.reply_text("Кто у тебя дома?", reply_markup=markup)
+
+    elif state == "AWAIT_PET_TYPE":
+        user_data[chat_id] = {"pet_type": text}
+        user_state[chat_id] = "AWAIT_PET_INFO"
+        await update.message.reply_text(
+            "Расскажи о питомце:\n1. Имя:\n2. Порода:\n3. Возраст:\n4. Вес:\n5. Пол:"
+        )
+
+    elif state == "AWAIT_PET_INFO":
+        user_data[chat_id]["pet_info"] = text
+        user_state[chat_id] = "AWAIT_HELP_AREA"
+        markup = ReplyKeyboardMarkup([
+            ["Уход и питание", "Поведение и здоровье"],
+            ["Игры и досуг", "Путешествия с питомцем"],
+            ["Экстренные советы", "Напиши свой вариант"]
+        ], resize_keyboard=True)
+        await update.message.reply_text("В чём тебе важнее всего моя помощь?", reply_markup=markup)
+
+    elif state == "AWAIT_HELP_AREA":
+        user_data[chat_id]["help_area"] = text
+        user_state[chat_id] = "AWAIT_REMINDER_SETUP"
+        markup = ReplyKeyboardMarkup([["Настроить", "Пропустить"]], resize_keyboard=True)
+        await update.message.reply_text(
+            "Хочешь, чтобы я напоминал о:\n- Кормлении\n- Обработках\n- Прививках\n- Стрижке когтей\n- Тренировках",
+            reply_markup=markup
+        )
+
+    elif state == "AWAIT_REMINDER_SETUP":
+        user_state[chat_id] = "DONE"
+        
+        # Отправляем контекст пользователя в Assistant
+        user_context = f"""
+        Информация о пользователе:
+        - Тип питомца: {user_data[chat_id].get('pet_type', 'Не указано')}
+        - Информация о питомце: {user_data[chat_id].get('pet_info', 'Не указано')}
+        - Интересующая область помощи: {user_data[chat_id].get('help_area', 'Не указано')}
+        
+        Пожалуйста, учитывай эту информацию при ответах на вопросы пользователя.
+        """
+        
+        await ask_assistant(user_context, chat_id)
+        
+        markup = ReplyKeyboardMarkup([["Воспитание", "Дрессировка", "Игры", "Уход"]], resize_keyboard=True)
+        await update.message.reply_text(
+            "Отлично, всё готово. Можешь задать любой вопрос:\n\n"
+            "Примеры:\n- Как приучить щенка к туалету?\n- Чем кормить щенка хаски?",
+            reply_markup=markup
+        )
+
+    elif state == "DONE":
+        await update.message.reply_text("Секунду, думаю…")
+        reply = await ask_assistant(text, chat_id)
+        await update.message.reply_text(reply)
+
+    else:
+        await update.message.reply_text("Пожалуйста, нажми /start для начала.")
+
+def main():
+    app = ApplicationBuilder().token(BOT_TOKEN).build()
+    app.add_handler(CommandHandler("start", start))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
+    app.run_polling()
 
 if __name__ == "__main__":
-    logging.basicConfig(level=logging.INFO)
-    executor.start_polling(dp, skip_updates=True)
+    main()
