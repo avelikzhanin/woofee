@@ -7,7 +7,6 @@ from dotenv import load_dotenv
 from openai import OpenAI
 from telegram import Update, ReplyKeyboardMarkup, ReplyKeyboardRemove
 from telegram.ext import ApplicationBuilder, CommandHandler, MessageHandler, ContextTypes, filters
-import requests
 from PIL import Image
 
 # Настройка логирования
@@ -36,44 +35,39 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     markup = ReplyKeyboardMarkup([["Далее"]], resize_keyboard=True, one_time_keyboard=True)
     await update.message.reply_text(
-        "Привет! Я твой помощник по уходу за домашним питомцем 🐕🐈\n"
+        "Привет! Я твой помощник по уходу за домашним питомцем 🐕��\n"
         "Помогу с уходом, дрессировками, играми и по любым вопросам.\n"
         "Также могу анализировать фотографии твоего питомца!\n"
         "Начнём с небольшой настройки — так я смогу быть максимально полезным.",
         reply_markup=markup
     )
 
-def encode_image_from_url(image_url: str) -> str:
-    """Скачивает изображение по URL и кодирует в base64"""
-    try:
-        logger.info(f"Скачиваем изображение: {image_url}")
-        response = requests.get(image_url, timeout=30)
-        response.raise_for_status()
-        
-        # Конвертируем в RGB если нужно и сжимаем
-        image = Image.open(io.BytesIO(response.content))
-        logger.info(f"Размер изображения: {image.size}, режим: {image.mode}")
-        
-        if image.mode != 'RGB':
-            image = image.convert('RGB')
-        
-        # Сжимаем изображение для экономии токенов
-        original_size = image.size
-        image.thumbnail((1024, 1024), Image.Resampling.LANCZOS)
-        logger.info(f"Сжато с {original_size} до {image.size}")
-        
-        # Конвертируем обратно в bytes
-        img_byte_arr = io.BytesIO()
-        image.save(img_byte_arr, format='JPEG', quality=85)
-        img_byte_arr.seek(0)
-        
-        encoded = base64.b64encode(img_byte_arr.read()).decode('utf-8')
-        logger.info("Изображение успешно закодировано в base64")
-        return encoded
-        
-    except Exception as e:
-        logger.error(f"Ошибка при обработке изображения: {e}")
-        return None
+async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Показать справку по командам"""
+    help_text = """
+🤖 Доступные команды:
+/start - Начать настройку бота
+/help - Показать эту справку
+/reset - Сбросить настройки и начать заново
+
+📸 Отправьте фото питомца для анализа
+💬 Задавайте любые вопросы о животных
+    """
+    await update.message.reply_text(help_text)
+
+async def reset_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Сбросить настройки пользователя"""
+    chat_id = update.effective_chat.id
+    
+    # Очищаем данные пользователя
+    user_state.pop(chat_id, None)
+    user_data.pop(chat_id, None)
+    user_threads.pop(chat_id, None)
+    
+    await update.message.reply_text(
+        "Настройки сброшены! Используйте /start для новой настройки."
+    )
+    logger.info(f"Пользователь {chat_id} сбросил настройки")
 
 async def ask_assistant(prompt: str, chat_id: int, image_base64: str = None) -> str:
     try:
@@ -88,7 +82,7 @@ async def ask_assistant(prompt: str, chat_id: int, image_base64: str = None) -> 
         if image_base64:
             logger.info(f"Отправляем изображение на анализ для пользователя {chat_id}")
             response = client.chat.completions.create(
-                model="gpt-4.1",
+                model="gpt-4-vision-preview",
                 messages=[
                     {
                         "role": "system",
@@ -182,18 +176,29 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
         photo = update.message.photo[-1]  # Берем фото наибольшего размера
         file = await context.bot.get_file(photo.file_id)
         
-        # ИСПРАВЛЕНО: Правильный способ получения URL изображения
-        image_url = f"https://api.telegram.org/file/bot{context.bot.token}/{file.file_path}"
-        logger.info(f"URL изображения: {image_url}")
+        # Скачиваем изображение напрямую
+        image_data = await file.download_as_bytearray()
         
-        # Кодируем изображение
-        image_base64 = encode_image_from_url(image_url)
+        # Конвертируем в PIL Image
+        image = Image.open(io.BytesIO(image_data))
+        logger.info(f"Размер изображения: {image.size}, режим: {image.mode}")
         
-        if not image_base64:
-            await update.message.reply_text(
-                "Не удалось обработать изображение. Попробуйте еще раз."
-            )
-            return
+        # Конвертируем в RGB если нужно
+        if image.mode != 'RGB':
+            image = image.convert('RGB')
+        
+        # Сжимаем изображение для экономии токенов
+        original_size = image.size
+        image.thumbnail((1024, 1024), Image.Resampling.LANCZOS)
+        logger.info(f"Сжато с {original_size} до {image.size}")
+        
+        # Конвертируем в base64
+        img_byte_arr = io.BytesIO()
+        image.save(img_byte_arr, format='JPEG', quality=85)
+        img_byte_arr.seek(0)
+        
+        image_base64 = base64.b64encode(img_byte_arr.read()).decode('utf-8')
+        logger.info("Изображение успешно закодировано в base64")
         
         # Получаем caption если есть
         caption = update.message.caption or "Проанализируй эту фотографию моего питомца"
@@ -255,7 +260,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await ask_assistant(user_context, chat_id)
         
         await update.message.reply_text(
-            "Отлично, всё готово! 🎉\n\n"
+            "Отлично, всё готово! ��\n\n"
             "Можешь:\n"
             "• Задать любой вопрос\n"
             "• Отправить фотографию питомца для анализа\n\n"
@@ -293,6 +298,8 @@ def main():
     
     # Добавляем обработчики
     app.add_handler(CommandHandler("start", start))
+    app.add_handler(CommandHandler("help", help_command))
+    app.add_handler(CommandHandler("reset", reset_command))
     app.add_handler(MessageHandler(filters.PHOTO, handle_photo))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
     
