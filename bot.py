@@ -2,12 +2,17 @@ import os
 import time
 import base64
 import io
+import logging
 from dotenv import load_dotenv
 from openai import OpenAI
 from telegram import Update, ReplyKeyboardMarkup, ReplyKeyboardRemove
 from telegram.ext import ApplicationBuilder, CommandHandler, MessageHandler, ContextTypes, filters
 import requests
 from PIL import Image
+
+# Настройка логирования
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+logger = logging.getLogger(__name__)
 
 load_dotenv()
 BOT_TOKEN = os.getenv("BOT_TOKEN")
@@ -27,6 +32,8 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     thread = client.beta.threads.create()
     user_threads[chat_id] = thread.id
     
+    logger.info(f"Новый пользователь {chat_id} начал настройку")
+    
     markup = ReplyKeyboardMarkup([["Далее"]], resize_keyboard=True, one_time_keyboard=True)
     await update.message.reply_text(
         "Привет! Я твой помощник по уходу за домашним питомцем 🐕🐈\n"
@@ -39,25 +46,33 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 def encode_image_from_url(image_url: str) -> str:
     """Скачивает изображение по URL и кодирует в base64"""
     try:
-        response = requests.get(image_url)
+        logger.info(f"Скачиваем изображение: {image_url}")
+        response = requests.get(image_url, timeout=30)
         response.raise_for_status()
         
         # Конвертируем в RGB если нужно и сжимаем
         image = Image.open(io.BytesIO(response.content))
+        logger.info(f"Размер изображения: {image.size}, режим: {image.mode}")
+        
         if image.mode != 'RGB':
             image = image.convert('RGB')
         
         # Сжимаем изображение для экономии токенов
+        original_size = image.size
         image.thumbnail((1024, 1024), Image.Resampling.LANCZOS)
+        logger.info(f"Сжато с {original_size} до {image.size}")
         
         # Конвертируем обратно в bytes
         img_byte_arr = io.BytesIO()
         image.save(img_byte_arr, format='JPEG', quality=85)
         img_byte_arr.seek(0)
         
-        return base64.b64encode(img_byte_arr.read()).decode('utf-8')
+        encoded = base64.b64encode(img_byte_arr.read()).decode('utf-8')
+        logger.info("Изображение успешно закодировано в base64")
+        return encoded
+        
     except Exception as e:
-        print(f"Ошибка при обработке изображения: {e}")
+        logger.error(f"Ошибка при обработке изображения: {e}")
         return None
 
 async def ask_assistant(prompt: str, chat_id: int, image_base64: str = None) -> str:
@@ -71,8 +86,9 @@ async def ask_assistant(prompt: str, chat_id: int, image_base64: str = None) -> 
         
         # Если есть изображение, используем Vision API напрямую
         if image_base64:
+            logger.info(f"Отправляем изображение на анализ для пользователя {chat_id}")
             response = client.chat.completions.create(
-                model="gpt-4.1",  # Ваша модель GPT-4.1
+                model="gpt-4.1",
                 messages=[
                     {
                         "role": "system",
@@ -107,9 +123,11 @@ async def ask_assistant(prompt: str, chat_id: int, image_base64: str = None) -> 
                 max_tokens=1000,
                 temperature=0.7
             )
+            logger.info("Получен ответ от Vision API")
             return response.choices[0].message.content
         
         # Обычное сообщение без изображения - используем Assistant API
+        logger.info(f"Отправляем текстовый запрос для пользователя {chat_id}")
         client.beta.threads.messages.create(
             thread_id=thread_id,
             role="user",
@@ -121,6 +139,7 @@ async def ask_assistant(prompt: str, chat_id: int, image_base64: str = None) -> 
             assistant_id=ASSISTANT_ID
         )
         
+        # Ждем завершения выполнения
         while run.status in ['queued', 'in_progress', 'cancelling']:
             time.sleep(1)
             run = client.beta.threads.runs.retrieve(
@@ -133,17 +152,21 @@ async def ask_assistant(prompt: str, chat_id: int, image_base64: str = None) -> 
             
             for message in messages.data:
                 if message.role == "assistant":
+                    logger.info("Получен ответ от Assistant API")
                     return message.content[0].text.value
         
+        logger.error(f"Ошибка выполнения Assistant: {run.status}")
         return f"Ошибка выполнения: {run.status}"
             
     except Exception as e:
-        print(f"Ошибка при обращении к OpenAI API: {e}")
+        logger.error(f"Ошибка при обращении к OpenAI API: {e}")
         return "Произошла ошибка при обращении к ИИ. Попробуй позже."
 
 async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
     state = user_state.get(chat_id, "")
+    
+    logger.info(f"Пользователь {chat_id} отправил фото")
     
     # Проверяем, завершена ли настройка
     if state != "DONE":
@@ -159,8 +182,9 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
         photo = update.message.photo[-1]  # Берем фото наибольшего размера
         file = await context.bot.get_file(photo.file_id)
         
-        # Получаем URL изображения
-        image_url = file.file_path
+        # ИСПРАВЛЕНО: Правильный способ получения URL изображения
+        image_url = f"https://api.telegram.org/file/bot{context.bot.token}/{file.file_path}"
+        logger.info(f"URL изображения: {image_url}")
         
         # Кодируем изображение
         image_base64 = encode_image_from_url(image_url)
@@ -173,13 +197,15 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
         
         # Получаем caption если есть
         caption = update.message.caption or "Проанализируй эту фотографию моего питомца"
+        logger.info(f"Caption: {caption}")
         
         # Отправляем на анализ
         response = await ask_assistant(caption, chat_id, image_base64)
         await update.message.reply_text(response)
+        logger.info(f"Анализ фото завершен для пользователя {chat_id}")
         
     except Exception as e:
-        print(f"Ошибка при обработке фото: {e}")
+        logger.error(f"Ошибка при обработке фото: {e}")
         await update.message.reply_text(
             "Произошла ошибка при анализе фотографии. Попробуйте еще раз."
         )
@@ -188,6 +214,8 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = update.message.text
     chat_id = update.effective_chat.id
     state = user_state.get(chat_id)
+
+    logger.info(f"Пользователь {chat_id} в состоянии {state} написал: {text}")
 
     if state == "AWAIT_NEXT" and text == "Далее":
         user_state[chat_id] = "AWAIT_PET_TYPE"
@@ -237,6 +265,8 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "- Отправь фото для анализа поведения или здоровья",
             reply_markup=ReplyKeyboardRemove()
         )
+        
+        logger.info(f"Настройка завершена для пользователя {chat_id}")
 
     elif state == "DONE":
         await update.message.reply_text("Секунду, думаю… 🤔")
@@ -246,15 +276,34 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     else:
         await update.message.reply_text("Пожалуйста, нажми /start для начала.")
 
+async def error_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Обработчик ошибок"""
+    logger.error(f"Ошибка: {context.error}")
+    if update and update.effective_message:
+        await update.effective_message.reply_text(
+            "Произошла ошибка. Попробуйте еще раз или обратитесь к разработчику."
+        )
+
 def main():
+    if not BOT_TOKEN or not OPENAI_API_KEY or not ASSISTANT_ID:
+        logger.error("Не все переменные окружения установлены! Проверьте .env файл")
+        return
+    
     app = ApplicationBuilder().token(BOT_TOKEN).build()
     
+    # Добавляем обработчики
     app.add_handler(CommandHandler("start", start))
     app.add_handler(MessageHandler(filters.PHOTO, handle_photo))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
     
-    print("Бот запущен! Поддерживается анализ фотографий 📸")
-    app.run_polling()
+    # Обработчик ошибок
+    app.add_error_handler(error_handler)
+    
+    logger.info("🚀 Бот запущен! Поддерживается анализ фотографий 📸")
+    print("🚀 Бот запущен! Поддерживается анализ фотографий 📸")
+    
+    # Запускаем бота
+    app.run_polling(drop_pending_updates=True)
 
 if __name__ == "__main__":
     main()
