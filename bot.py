@@ -1,132 +1,136 @@
 import os
 import time
 import base64
-import io
-import logging
+import requests
 from dotenv import load_dotenv
 from openai import OpenAI
 from telegram import Update, ReplyKeyboardMarkup, ReplyKeyboardRemove
 from telegram.ext import ApplicationBuilder, CommandHandler, MessageHandler, ContextTypes, filters
-from PIL import Image
-
-# Настройка логирования
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
-logger = logging.getLogger(__name__)
 
 load_dotenv()
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
-ASSISTANT_ID = os.getenv("ASSISTANT_ID")
+ASSISTANT_ID = os.getenv("ASSISTANT_ID")  # ID вашего Assistant
 
 client = OpenAI(api_key=OPENAI_API_KEY)
 
 user_state = {}
 user_data = {}
-user_threads = {}
+user_threads = {}  # Для хранения thread_id каждого пользователя
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
     user_state[chat_id] = "AWAIT_NEXT"
     
+    # Создаем новый thread для пользователя
     thread = client.beta.threads.create()
     user_threads[chat_id] = thread.id
     
-    logger.info(f"Новый пользователь {chat_id} начал настройку")
-    
     markup = ReplyKeyboardMarkup([["Далее"]], resize_keyboard=True, one_time_keyboard=True)
     await update.message.reply_text(
-        "Привет! Я твой помощник по уходу за домашним питомцем 🐕��\n"
+        "Привет! Я твой помощник по уходу за домашним питомцем.\n"
         "Помогу с уходом, дрессировками, играми и по любым вопросам.\n"
         "Также могу анализировать фотографии твоего питомца!\n"
         "Начнём с небольшой настройки — так я смогу быть максимально полезным.",
         reply_markup=markup
     )
 
-async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Показать справку по командам"""
-    help_text = """
-🤖 Доступные команды:
-/start - Начать настройку бота
-/help - Показать эту справку
-/reset - Сбросить настройки и начать заново
+async def download_photo(photo_file_id: str, bot_token: str) -> bytes:
+    """Загружает фото из Telegram и возвращает его в виде байтов"""
+    try:
+        # Получаем информацию о файле
+        file_info_url = f"https://api.telegram.org/bot{bot_token}/getFile?file_id={photo_file_id}"
+        file_info_response = requests.get(file_info_url)
+        file_info = file_info_response.json()
+        
+        if not file_info.get('ok'):
+            raise Exception(f"Ошибка получения информации о файле: {file_info}")
+        
+        file_path = file_info['result']['file_path']
+        
+        # Загружаем файл
+        file_url = f"https://api.telegram.org/file/bot{bot_token}/{file_path}"
+        file_response = requests.get(file_url)
+        
+        return file_response.content
+        
+    except Exception as e:
+        print(f"Ошибка загрузки фото: {e}")
+        raise
 
-📸 Отправьте фото питомца для анализа
-💬 Задавайте любые вопросы о животных
-    """
-    await update.message.reply_text(help_text)
+async def analyze_photo_with_gpt(image_bytes: bytes, text_prompt: str = "") -> str:
+    """Анализирует фото с помощью GPT-4 Vision"""
+    try:
+        # Конвертируем изображение в base64
+        base64_image = base64.b64encode(image_bytes).decode('utf-8')
+        
+        # Создаем промпт для анализа изображения питомца
+        system_prompt = """Ты профессиональный ветеринар и специалист по уходу за домашними животными. 
+        Анализируй фотографии животных и давай полезные рекомендации по:
+        - Здоровью и состоянию питомца
+        - Уходу и содержанию
+        - Поведению
+        - Питанию
+        - Безопасности
+        
+        Отвечай на русском языке, будь внимательным и заботливым."""
+        
+        user_prompt = f"""Проанализируй эту фотографию питомца. 
+        {text_prompt if text_prompt else "Что ты видишь? Дай рекомендации по уходу, здоровью или поведению на основе того, что изображено."}
+        
+        Обрати внимание на:
+        1. Общее состояние животного
+        2. Условия содержания (если видны)
+        3. Возможные проблемы или опасности
+        4. Рекомендации по улучшению ухода
+        """
+        
+        response = client.chat.completions.create(
+            model="gpt-4o",  # или "gpt-4-vision-preview" если используете старую версию
+            messages=[
+                {"role": "system", "content": system_prompt},
+                {
+                    "role": "user", 
+                    "content": [
+                        {"type": "text", "text": user_prompt},
+                        {
+                            "type": "image_url",
+                            "image_url": {
+                                "url": f"data:image/jpeg;base64,{base64_image}",
+                                "detail": "high"
+                            }
+                        }
+                    ]
+                }
+            ],
+            max_tokens=1000,
+            temperature=0.7
+        )
+        
+        return response.choices[0].message.content
+        
+    except Exception as e:
+        print(f"Ошибка анализа фото с GPT: {e}")
+        return f"Извини, не смог проанализировать фото. Ошибка: {str(e)}"
 
-async def reset_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Сбросить настройки пользователя"""
-    chat_id = update.effective_chat.id
-    
-    user_state.pop(chat_id, None)
-    user_data.pop(chat_id, None)
-    user_threads.pop(chat_id, None)
-    
-    await update.message.reply_text(
-        "Настройки сброшены! Используйте /start для новой настройки."
-    )
-    logger.info(f"Пользователь {chat_id} сбросил настройки")
-
-async def ask_assistant(prompt: str, chat_id: int, image_base64: str = None) -> str:
+async def ask_assistant(prompt: str, chat_id: int) -> str:
     try:
         thread_id = user_threads.get(chat_id)
         
         if not thread_id:
+            # Создаем новый thread если его нет
             thread = client.beta.threads.create()
             user_threads[chat_id] = thread.id
             thread_id = thread.id
         
-        # Если есть изображение, используем Vision API напрямую
-        if image_base64:
-            logger.info(f"Отправляем изображение на анализ для пользователя {chat_id}")
-            response = client.chat.completions.create(
-                model="gpt-4o",
-                messages=[
-                    {
-                        "role": "system",
-                        "content": """Ты — заботливый и опытный помощник для владельцев домашних животных. 
-                        
-                        При анализе фотографий:
-                        - Описывай питомца позитивно и с любовью
-                        - Обращай внимание на здоровье, поведение, окружение
-                        - Давай советы по уходу если видишь что-то важное
-                        - Избегай негативных слов: вместо "старый" говори "взрослый", "мудрый"
-                        - Будь эмпатичным и поддерживающим
-                        
-                        Отвечай БЕЗ Markdown-разметки (не используй **, *, # и т.д.)"""
-                    },
-                    {
-                        "role": "user", 
-                        "content": [
-                            {
-                                "type": "text",
-                                "text": f"{prompt}\n\nИнформация о питомце владельца:\n{user_data.get(chat_id, {})}"
-                            },
-                            {
-                                "type": "image_url",
-                                "image_url": {
-                                    "url": f"data:image/jpeg;base64,{image_base64}",
-                                    "detail": "high"
-                                }
-                            }
-                        ]
-                    }
-                ],
-                max_tokens=1000,
-                temperature=0.7
-            )
-            logger.info("Получен ответ от Vision API")
-            return response.choices[0].message.content
-        
-        # Обычное сообщение без изображения - используем Assistant API
-        logger.info(f"Отправляем текстовый запрос для пользователя {chat_id}")
+        # Добавляем сообщение в thread
         client.beta.threads.messages.create(
             thread_id=thread_id,
             role="user",
             content=prompt
         )
         
+        # Запускаем Assistant
         run = client.beta.threads.runs.create(
             thread_id=thread_id,
             assistant_id=ASSISTANT_ID
@@ -141,187 +145,72 @@ async def ask_assistant(prompt: str, chat_id: int, image_base64: str = None) -> 
             )
         
         if run.status == 'completed':
-            messages = client.beta.threads.messages.list(thread_id=thread_id)
+            # Получаем сообщения из thread
+            messages = client.beta.threads.messages.list(
+                thread_id=thread_id
+            )
             
+            # Возвращаем последний ответ Assistant
             for message in messages.data:
                 if message.role == "assistant":
-                    logger.info("Получен ответ от Assistant API")
                     return message.content[0].text.value
         
-        logger.error(f"Ошибка выполнения Assistant: {run.status}")
-        return f"Ошибка выполнения: {run.status}"
+        elif run.status == 'requires_action':
+            # Если требуется действие (например, function calling)
+            return "Assistant требует дополнительных действий. Попробуйте переформулировать вопрос."
+        
+        else:
+            return f"Ошибка выполнения: {run.status}"
             
     except Exception as e:
-        logger.error(f"Ошибка при обращении к OpenAI API: {e}")
+        print(f"Ошибка при обращении к Assistant API: {e}")
         return "Произошла ошибка при обращении к ИИ. Попробуй позже."
 
 async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Обработка фотографий"""
     chat_id = update.effective_chat.id
-    state = user_state.get(chat_id, "")
+    state = user_state.get(chat_id)
     
-    logger.info(f"Пользователь {chat_id} отправил фото")
-    
-    # Проверяем, завершена ли настройка
     if state != "DONE":
         await update.message.reply_text(
-            "Пожалуйста, сначала завершите настройку с помощью команды /start"
+            "Сначала завершите настройку бота с помощью команды /start"
         )
         return
     
-    await update.message.reply_text("Анализирую фотографию... 📸")
-    
     try:
-        # Получаем информацию о фото
-        photo = update.message.photo[-1]  # Берем фото наибольшего размера
-        file = await context.bot.get_file(photo.file_id)
+        await update.message.reply_text("📸 Анализирую фотографию...")
         
-        # Получаем URL файла от Telegram
-        file_url = file.file_path
-        if not file_url.startswith('http'):
-            file_url = f"https://api.telegram.org/file/bot{BOT_TOKEN}/{file_url}"
+        # Получаем самое большое фото (лучшее качество)
+        photo = update.message.photo[-1]
         
-        logger.info(f"URL файла: {file_url}")
+        # Загружаем фото
+        image_bytes = await download_photo(photo.file_id, BOT_TOKEN)
         
-        # Получаем caption если есть
-        caption = update.message.caption or "Проанализируй эту фотографию моего питомца"
-        logger.info(f"Caption: {caption}")
+        # Получаем текст сообщения, если есть
+        caption = update.message.caption or ""
         
-        # Отправляем на анализ используя URL изображения
-        try:
-            response = client.chat.completions.create(
-                model="gpt-4o",
-                messages=[
-                    {
-                        "role": "system",
-                        "content": """Ты — заботливый и опытный помощник для владельцев домашних животных. 
-                        
-                        При анализе фотографий:
-                        - Описывай питомца позитивно и с любовью
-                        - Обращай внимание на здоровье, поведение, окружение
-                        - Давай советы по уходу если видишь что-то важное
-                        - Избегай негативных слов: вместо "старый" говори "взрослый", "мудрый"
-                        - Будь эмпатичным и поддерживающим
-                        
-                        Отвечай БЕЗ Markdown-разметки (не используй **, *, # и т.д.)"""
-                    },
-                    {
-                        "role": "user", 
-                        "content": [
-                            {
-                                "type": "text",
-                                "text": f"{caption}\n\nИнформация о питомце владельца:\n{user_data.get(chat_id, {})}"
-                            },
-                            {
-                                "type": "image_url",
-                                "image_url": {
-                                    "url": file_url,
-                                    "detail": "high"
-                                }
-                            }
-                        ]
-                    }
-                ],
-                max_tokens=1000,
-                temperature=0.7
-            )
-            
-            ai_response = response.choices[0].message.content
-            logger.info("Получен ответ от Vision API")
-            await update.message.reply_text(ai_response)
-            logger.info(f"Анализ фото завершен для пользователя {chat_id}")
-            
-        except Exception as api_error:
-            logger.error(f"Ошибка Vision API: {api_error}")
-            
-            # Если не удалось через URL, пробуем через base64
-            try:
-                logger.info("Пробуем альтернативный способ через base64")
-                
-                # Скачиваем изображение напрямую
-                image_data = await file.download_as_bytearray()
-                
-                # Конвертируем в PIL Image
-                image = Image.open(io.BytesIO(image_data))
-                logger.info(f"Размер изображения: {image.size}, режим: {image.mode}")
-                
-                # Конвертируем в RGB если нужно
-                if image.mode != 'RGB':
-                    image = image.convert('RGB')
-                
-                # Сжимаем изображение для экономии токенов
-                original_size = image.size
-                image.thumbnail((1024, 1024), Image.Resampling.LANCZOS)
-                logger.info(f"Сжато с {original_size} до {image.size}")
-                
-                # Конвертируем в base64
-                img_byte_arr = io.BytesIO()
-                image.save(img_byte_arr, format='JPEG', quality=85)
-                img_byte_arr.seek(0)
-                
-                image_base64 = base64.b64encode(img_byte_arr.read()).decode('utf-8')
-                logger.info("Изображение успешно закодировано в base64")
-                
-                # Пробуем через base64
-                response = client.chat.completions.create(
-                    model="gpt-4o",
-                    messages=[
-                        {
-                            "role": "system",
-                            "content": """Ты — заботливый и опытный помощник для владельцев домашних животных. 
-                            
-                            При анализе фотографий:
-                            - Описывай питомца позитивно и с любовью
-                            - Обращай внимание на здоровье, поведение, окружение
-                            - Давай советы по уходу если видишь что-то важное
-                            - Избегай негативных слов: вместо "старый" говори "взрослый", "мудрый"
-                            - Будь эмпатичным и поддерживающим
-                            
-                            Отвечай БЕЗ Markdown-разметки (не используй **, *, # и т.д.)"""
-                        },
-                        {
-                            "role": "user", 
-                            "content": [
-                                {
-                                    "type": "text",
-                                    "text": f"{caption}\n\nИнформация о питомце владельца:\n{user_data.get(chat_id, {})}"
-                                },
-                                {
-                                    "type": "image_url",
-                                    "image_url": {
-                                        "url": f"data:image/jpeg;base64,{image_base64}",
-                                        "detail": "high"
-                                    }
-                                }
-                            ]
-                        }
-                    ],
-                    max_tokens=1000,
-                    temperature=0.7
-                )
-                
-                ai_response = response.choices[0].message.content
-                logger.info("Получен ответ от Vision API через base64")
-                await update.message.reply_text(ai_response)
-                logger.info(f"Анализ фото завершен для пользователя {chat_id}")
-                
-            except Exception as base64_error:
-                logger.error(f"Ошибка base64 метода: {base64_error}")
-                await update.message.reply_text(
-                    "Произошла ошибка при анализе изображения. Попробуйте еще раз или опишите питомца текстом."
-                )
+        # Анализируем фото с помощью GPT Vision
+        analysis_result = await analyze_photo_with_gpt(image_bytes, caption)
+        
+        await update.message.reply_text(f"🔍 **Анализ фотографии:**\n\n{analysis_result}")
+        
+        # Также добавляем результат анализа в контекст Assistant
+        context_message = f"Пользователь прислал фотографию. Результат анализа: {analysis_result}"
+        if caption:
+            context_message += f"\nПодпись к фото: {caption}"
+        
+        await ask_assistant(context_message, chat_id)
         
     except Exception as e:
-        logger.error(f"Ошибка при обработке фото: {e}")
+        print(f"Ошибка обработки фото: {e}")
         await update.message.reply_text(
-            "Произошла ошибка при обработке фотографии. Попробуйте еще раз."
+            "Извини, не смог обработать фотографию. Попробуй еще раз или отправь другое фото."
         )
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = update.message.text
     chat_id = update.effective_chat.id
     state = user_state.get(chat_id)
-
-    logger.info(f"Пользователь {chat_id} в состоянии {state} написал: {text}")
 
     if state == "AWAIT_NEXT" and text == "Далее":
         user_state[chat_id] = "AWAIT_PET_TYPE"
@@ -349,6 +238,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         user_data[chat_id]["help_area"] = text
         user_state[chat_id] = "DONE"
         
+        # Отправляем контекст пользователя в Assistant
         user_context = f"""
         Информация о пользователе:
         - Тип питомца: {user_data[chat_id].get('pet_type', 'Не указано')}
@@ -361,57 +251,25 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await ask_assistant(user_context, chat_id)
         
         await update.message.reply_text(
-            "Отлично, всё готово! ��\n\n"
-            "Можешь:\n"
-            "• Задать любой вопрос\n"
-            "• Отправить фотографию питомца для анализа\n\n"
-            "Примеры:\n"
-            "- Как приучить щенка к туалету?\n"
-            "- Чем кормить котенка?\n"
-            "- Отправь фото для анализа поведения или здоровья",
+            "Отлично, всё готово! Можешь задать любой вопрос или отправить фото питомца для анализа:\n\n"
+            "Примеры:\n- Как приучить щенка к туалету?\n- Чем кормить щенка хаски?\n- 📸 Отправь фото питомца для анализа",
             reply_markup=ReplyKeyboardRemove()
         )
-        
-        logger.info(f"Настройка завершена для пользователя {chat_id}")
 
     elif state == "DONE":
-        await update.message.reply_text("Секунду, думаю… 🤔")
+        await update.message.reply_text("Секунду, думаю…")
         reply = await ask_assistant(text, chat_id)
         await update.message.reply_text(reply)
 
     else:
         await update.message.reply_text("Пожалуйста, нажми /start для начала.")
 
-async def error_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Обработчик ошибок"""
-    logger.error(f"Ошибка: {context.error}")
-    if update and update.effective_message:
-        await update.effective_message.reply_text(
-            "Произошла ошибка. Попробуйте еще раз или обратитесь к разработчику."
-        )
-
 def main():
-    if not BOT_TOKEN or not OPENAI_API_KEY or not ASSISTANT_ID:
-        logger.error("Не все переменные окружения установлены! Проверьте .env файл")
-        return
-    
     app = ApplicationBuilder().token(BOT_TOKEN).build()
-    
-    # Добавляем обработчики
     app.add_handler(CommandHandler("start", start))
-    app.add_handler(CommandHandler("help", help_command))
-    app.add_handler(CommandHandler("reset", reset_command))
-    app.add_handler(MessageHandler(filters.PHOTO, handle_photo))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
-    
-    # Обработчик ошибок
-    app.add_error_handler(error_handler)
-    
-    logger.info("🚀 Бот запущен! Поддерживается анализ фотографий 📸")
-    print("🚀 Бот запущен! Поддерживается анализ фотографий 📸")
-    
-    # Запускаем бота
-    app.run_polling(drop_pending_updates=True)
+    app.add_handler(MessageHandler(filters.PHOTO, handle_photo))  # Обработчик фотографий
+    app.run_polling()
 
 if __name__ == "__main__":
     main()
