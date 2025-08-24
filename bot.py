@@ -93,11 +93,16 @@ async def analyze_photo_with_gpt(image_bytes: bytes, text_prompt: str = "") -> s
     try:
         base64_image = base64.b64encode(image_bytes).decode('utf-8')
         
-        user_prompt = f"Проанализируй эту фотографию питомца. {text_prompt if text_prompt else 'Что ты видишь? Дай рекомендации по уходу, здоровью или поведению.'}"
+        system_prompt = """Ты профессиональный ветеринар и эксперт по уходу за домашними животными. 
+        Анализируй фотографии питомцев и давай полезные рекомендации по здоровью, уходу, поведению и безопасности.
+        Отвечай на русском языке, будь внимательным и заботливым."""
+        
+        user_prompt = f"Проанализируй эту фотографию питомца. {text_prompt if text_prompt else 'Что ты видишь? Дай рекомендации по уходу, здоровью или поведению на основе изображения.'}"
         
         response = client.chat.completions.create(
             model="gpt-4o",
             messages=[
+                {"role": "system", "content": system_prompt},
                 {
                     "role": "user", 
                     "content": [
@@ -112,7 +117,8 @@ async def analyze_photo_with_gpt(image_bytes: bytes, text_prompt: str = "") -> s
                     ]
                 }
             ],
-            max_tokens=1000
+            max_tokens=1500,
+            temperature=0.7
         )
         
         return response.choices[0].message.content
